@@ -128,7 +128,6 @@ class HyperWormhole {
             await this.cleanup();
         });
 
-        await this.calculateTotalSize(filePath);
         await drive.ready();
 
         const stats = await fs.stat(filePath);
@@ -157,9 +156,9 @@ class HyperWormhole {
         goodbye(() => swarm.destroy());
 
         return new Promise((resolve) => {
-            const initialDiscovery = swarm.join(initialTopic, { server: true, client: false });
+            const initialDiscovery = swarm.join(initialTopic, { server: true, client: true });
 
-            swarm.once('connection', async (socket) => {
+            swarm.once('connection', async (socket, peerInfo) => {
                 console.log(crayon.yellow('Receiver connected. Starting SPAKE2 exchange...'));
 
                 try {
@@ -218,15 +217,26 @@ class HyperWormhole {
     async receiveData(wormholeCode, outputPath) {
         const initialTopic = this.wormholeCodeToTopic(wormholeCode);
 
+        console.log(initialTopic)
+
         console.log(crayon.cyan('Connecting to sender...'));
 
         const swarm = new Hyperswarm();
         goodbye(() => swarm.destroy());
 
         const driveKey = await new Promise((resolve, reject) => {
-            const initialDiscovery = swarm.join(initialTopic, { server: false, client: true });
+            const initialDiscovery = swarm.join(initialTopic, { server: true, client: true });
+            
+            initialDiscovery.flushed().then(() => {
+                console.log('Initial discovery flushed');
+            });
+    
+            swarm.on('peer', (peer) => {
+                console.log('Peer discovered:', peer);
+            });
 
-            swarm.once('connection', async (socket) => {
+            swarm.once('connection', async (socket, peerInfo) => {
+                console.log(peerInfo)
                 console.log(crayon.green('Connected to sender. Starting SPAKE2 exchange...'));
 
                 try {
@@ -278,21 +288,20 @@ class HyperWormhole {
         // Join the Hyperdrive's discovery swarm
         swarm.join(drive.discoveryKey);
         let senderSocket;
-        swarm.on('connection', (socket) => {
+        swarm.on('connection', async (socket) => {
             console.log(crayon.yellow('Connected to sender. Starting replication...'));
             drive.replicate(socket);
             senderSocket = socket;
+            try {
+                await this.downloadDriveContents(drive, outputPath);
+            } catch {
+                console.log("something wrong happened with file download")
+            }
         });
 
         await swarm.flush();
 
         console.log(crayon.green('Waiting for files...'));
-
-        try {
-            await this.downloadDriveContents(drive, outputPath);
-        } catch {
-            console.log("something wrong happened with file download")
-        }
 
         console.log(crayon.green('File transfer completed'));
 
