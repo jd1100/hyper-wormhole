@@ -152,7 +152,6 @@ class HyperWormhole {
         console.log('Waiting for receiver to connect...');
 
         const store = await this.createTempCorestore();
-        console.log(store)
         const drive = new Hyperdrive(store);
 
         teardown(async () => {
