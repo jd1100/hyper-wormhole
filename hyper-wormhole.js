@@ -157,7 +157,7 @@ class HyperWormhole {
         goodbye(() => swarm.destroy());
 
         return new Promise((resolve) => {
-            const initialDiscovery = swarm.join(initialTopic, { server: true, client: false });
+            const initialDiscovery = swarm.join(initialTopic, { server: true, client: true });
 
             swarm.once('connection', async (socket) => {
                 console.log(crayon.yellow('Receiver connected. Starting SPAKE2 exchange...'));
@@ -224,7 +224,7 @@ class HyperWormhole {
         goodbye(() => swarm.destroy());
 
         const driveKey = await new Promise((resolve, reject) => {
-            const initialDiscovery = swarm.join(initialTopic, { server: false, client: true });
+            const initialDiscovery = swarm.join(initialTopic, { server: true, client: true });
 
             swarm.once('connection', async (socket) => {
                 console.log(crayon.green('Connected to sender. Starting SPAKE2 exchange...'));
