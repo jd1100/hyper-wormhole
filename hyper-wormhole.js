@@ -166,20 +166,23 @@ class HyperWormhole {
                     const { key: passwordHash, salt } = this.spake2.hashPassword(wormholeCode);
                     const aliceKeyPair = this.spake2.generateKeyPair();
                     const aliceResult = this.spake2.computeX(true, aliceKeyPair.privateKey, passwordHash);
-
+        
                     socket.write(Buffer.concat([salt, aliceResult.X]));
                     const bobData = await new Promise(resolve => socket.once('data', resolve));
                     const bobX = bobData.slice(0, 32);
-
+        
                     const sharedSecret = this.spake2.computeSharedSecret(aliceResult.xPrivate, bobX);
                     const sessionKey = this.spake2.deriveSessionKey(true, aliceResult.X, bobX, sharedSecret);
-
+        
                     console.log('SPAKE2 exchange completed.');
-
-                    // Send the drive key
-                    socket.write(drive.key);
-
-                    console.log(crayon.green('Drive key sent to receiver. Starting file transfer...'));
+        
+                    // Encrypt the drive key with the session key
+                    const encryptedDriveKey = this.encrypt(drive.key, sessionKey);
+        
+                    // Send the encrypted drive key
+                    socket.write(encryptedDriveKey);
+        
+                    console.log(crayon.green('Encrypted drive key sent to receiver. Starting file transfer...'));
 
                     socket.end();
                     initialDiscovery.destroy();
@@ -217,17 +220,18 @@ class HyperWormhole {
 
     async receiveData(wormholeCode, outputPath) {
         const initialTopic = this.wormholeCodeToTopic(wormholeCode);
-
+    
         console.log(crayon.cyan('Connecting to sender...'));
-
+    
         const swarm = new Hyperswarm();
         goodbye(() => swarm.destroy());
-
+    
         const driveKey = await new Promise((resolve, reject) => {
             const initialDiscovery = swarm.join(initialTopic, { server: true, client: true });
 
             swarm.once('connection', async (socket) => {
                 console.log(crayon.green('Connected to sender. Starting SPAKE2 exchange...'));
+
 
                 try {
                     const aliceData = await new Promise(resolve => socket.once('data', resolve));
@@ -245,10 +249,13 @@ class HyperWormhole {
 
                     console.log('SPAKE2 exchange completed.');
 
-                    // Receive the drive key
-                    const driveKey = await new Promise(resolve => socket.once('data', resolve));
+                    // Receive the encrypted drive key
+                    const encryptedDriveKey = await new Promise(resolve => socket.once('data', resolve));
 
-                    console.log(crayon.green('Received drive key. Starting file transfer...'));
+                    // Decrypt the drive key
+                    const driveKey = this.decrypt(encryptedDriveKey, sessionKey);
+
+                    console.log(crayon.green('Received and decrypted drive key. Starting file transfer...'));
                     console.log('Drive key:', HypercoreId.encode(driveKey));
 
                     socket.end();
@@ -259,48 +266,68 @@ class HyperWormhole {
                 }
             });
         });
-
+    
         const store = await this.createTempCorestore();
         const drive = new Hyperdrive(store, driveKey);
-
+    
         goodbye(async () => {
             await drive.close();
             await store.close();
             await this.cleanup();
         });
-
+    
         await drive.ready();
         console.log('Drive is ready. Starting download...');
-
-        this.totalSize = 0;
-        this.transferredSize = 0;
-
+    
         // Join the Hyperdrive's discovery swarm
         swarm.join(drive.discoveryKey);
+        console.log(`Joined drive discovery key: ${drive.discoveryKey.toString('hex')}`);
+    
         let senderSocket;
         swarm.on('connection', (socket) => {
             console.log(crayon.yellow('Connected to sender. Starting replication...'));
             drive.replicate(socket);
             senderSocket = socket;
         });
-
+    
         await swarm.flush();
-
-        console.log(crayon.green('Waiting for files...'));
-
-        try {
-            await this.downloadDriveContents(drive, outputPath);
-        } catch {
-            console.log("something wrong happened with file download")
+        console.log('Swarm flushed. Waiting for files...');
+    
+        // Add a delay to allow for initial replication
+        console.log('Waiting for initial replication...');
+        await new Promise(resolve => setTimeout(resolve, 5000));
+    
+        const maxRetries = 3;
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            console.log(`Download attempt ${attempt} of ${maxRetries}`);
+            
+            console.log('Drive state before download:');
+    
+            try {
+                await this.downloadDriveContents(drive, outputPath);
+                console.log(crayon.green('File transfer completed successfully'));
+                break;
+            } catch (error) {
+                console.error(`Error in download attempt ${attempt}:`, error);
+                
+                if (attempt === maxRetries) {
+                    console.error('Max retries reached. Download failed.');
+                } else {
+                    console.log('Waiting before next attempt...');
+                    await new Promise(resolve => setTimeout(resolve, 5000));
+                }
+            }
         }
-
-        console.log(crayon.green('File transfer completed'));
-
+    
         // Signal completion to sender
         if (senderSocket) {
             senderSocket.write('TRANSFER_COMPLETE');
         }
-
+    
+        await drive.close();
+        await store.close();
+        await this.cleanup();
+    
         swarm.destroy();
     }
 
@@ -344,35 +371,54 @@ class HyperWormhole {
     }
 
     async downloadDriveContents(drive, outputPath) {
+        console.log(`Starting downloadDriveContents to ${outputPath}`);
+        let fileCount = 0;
+        let totalSize = 0;
+    
+    
         for await (const entry of drive.list({ recursive: true })) {
-            if (!entry.value.blob) continue;
-
-            console.log(entry.key);
-            const monitor = drive.monitor(entry.key);
-            await monitor.ready();
-            this.monitors.add(monitor);
-
-            monitor.on('update', () => {
-                this.updateProgressBar('Downloading', monitor.downloadStats);
-            });
-
+            if (!entry.value.blob) {
+                console.log(`Skipping non-blob entry: ${entry.key}`);
+                continue;
+            }
+    
+            fileCount++;
+            console.log(`Processing file ${fileCount}: ${entry.key}`);
+            
             const filePath = path.join(outputPath, entry.key);
             await fs.mkdir(path.dirname(filePath), { recursive: true });
-
+    
             try {
+                const fileMonitor = drive.monitor(entry.key);
+                await fileMonitor.ready();
+
+                fileMonitor.on('update', () => {
+                    this.updateProgressBar('Downloading', fileMonitor.downloadStats);
+                });
+                totalSize += fileMonitor.downloadStats.targetBytes;
+                console.log(`File size: ${fileMonitor.downloadStats.targetBytes} bytes`);
+    
                 const readStream = drive.createReadStream(entry.key);
                 const writeStream = fsSync.createWriteStream(filePath);
-
+    
                 await pipeline(readStream, writeStream);
-
-                console.log(`Downloaded and saved: ${crayon.yellow(filePath)}`);
+    
+                console.log(`\nDownloaded and saved: ${crayon.yellow(filePath)}`);
+                fileMonitor.close();
             } catch (error) {
                 console.error(`Error downloading file ${entry.key}:`, error);
-                // Optionally, you might want to remove the partially downloaded file
                 await fs.unlink(filePath).catch(() => {});
+                throw error; // Rethrow to trigger retry
             }
         }
+    
+        console.log(`Download complete. Total files: ${fileCount}, Total size: ${totalSize} bytes`);
+        
+        if (fileCount === 0) {
+            throw new Error('No files were downloaded');
+        }
     }
+    
 
     wormholeCodeToTopic(code) {
         return crypto.createHash('sha256').update(code).digest();
