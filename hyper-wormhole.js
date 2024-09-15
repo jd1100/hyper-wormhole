@@ -153,7 +153,7 @@ class HyperWormhole {
             }
         }
 
-        const swarm = new Hyperswarm();
+        const swarm = new Hyperswarm({ maxPeers: 10 });
         goodbye(() => swarm.destroy());
 
         return new Promise((resolve) => {
@@ -223,7 +223,7 @@ class HyperWormhole {
     
         console.log(crayon.cyan('Connecting to sender...'));
     
-        const swarm = new Hyperswarm();
+        const swarm = new Hyperswarm({ maxPeers: 10 });
         goodbye(() => swarm.destroy());
     
         const driveKey = await new Promise((resolve, reject) => {
