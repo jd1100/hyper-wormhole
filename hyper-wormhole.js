@@ -18,6 +18,8 @@ const os = require('os');
 const { pipeline } = require('stream/promises');
 var singleLineLog = require('single-line-log').stdout;
 process.stdout.isTTY = true;
+
+const SERVER_TOPIC = 'hyperwormhole-server-topic';
 const WORDLIST = [
     'aardvark', 'absurd', 'accrue', 'acme', 'adrift', 'adult', 'afflict', 'ahead', 'aimless', 'algol', 'allow', 'alone',
     'ammo', 'ancient', 'apple', 'artist', 'assume', 'athens', 'atlas', 'aztec', 'baboon', 'backfield', 'backward', 'banjo',
@@ -92,6 +94,31 @@ class HyperWormhole {
         this.totalSize = 0;
         this.transferredSize = 0;
         this.monitors = new Set();
+        this.serverSwarm = null;
+    }
+
+    async startServer() {
+        console.log(crayon.cyan('Starting HyperWormhole server...'));
+        this.serverSwarm = new Hyperswarm();
+        goodbye(() => this.serverSwarm.destroy());
+
+        const serverTopic = crypto.createHash('sha256').update(SERVER_TOPIC).digest();
+        this.serverSwarm.join(serverTopic, { server: true, client: false });
+
+        this.serverSwarm.on('connection', (socket) => {
+            console.log(crayon.green('New peer connected to server'));
+            socket.on('data', (data) => {
+                if (data.length === 32) {
+                    const driveDiscoveryKey = data.toString('hex');
+                    console.log(crayon.yellow(`Received drive discovery key: ${driveDiscoveryKey}`));
+                    this.serverSwarm.join(Buffer.from(driveDiscoveryKey, 'hex'), { server: true, client: true });
+                    console.log(crayon.green(`Joined drive discovery key: ${driveDiscoveryKey}`));
+                }
+            });
+        });
+
+        await this.serverSwarm.listen();
+        console.log(crayon.green('HyperWormhole server is running and listening for connections'));
     }
 
     async createTempCorestore() {
@@ -155,6 +182,17 @@ class HyperWormhole {
 
         const swarm = new Hyperswarm({ maxPeers: 10 });
         goodbye(() => swarm.destroy());
+
+        // Join the server topic to publish the drive discovery key
+        const serverTopic = crypto.createHash('sha256').update(SERVER_TOPIC).digest();
+        const serverDiscovery = swarm.join(serverTopic, { server: false, client: true });
+        
+        serverDiscovery.flushed().then(() => {
+            console.log(crayon.cyan('Connected to HyperWormhole server. Publishing drive discovery key.'));
+            for (const connection of swarm.connections) {
+                connection.write(drive.discoveryKey);
+            }
+        });
 
         return new Promise((resolve) => {
             const initialDiscovery = swarm.join(initialTopic, { server: true, client: true });
@@ -521,6 +559,21 @@ function createCLI() {
                 await wormhole.receiveData(key, finalOutputPath);
             } catch (error) {
                 console.error(crayon.red('Error receiving data:'), error);
+                process.exit(1);
+            }
+        });
+
+    program
+        .command('server')
+        .description('Run as a HyperWormhole server')
+        .action(async () => {
+            const wormhole = new HyperWormhole();
+            try {
+                await wormhole.startServer();
+                // Keep the process running
+                process.stdin.resume();
+            } catch (error) {
+                console.error(crayon.red('Error starting server:'), error);
                 process.exit(1);
             }
         });
