@@ -33,8 +33,9 @@ const WORDLIST = [
 
 class ImprovedSPAKE2 {
     constructor() {
-        this.M = x25519.utils.randomPrivateKey();
-        this.N = x25519.utils.randomPrivateKey();
+        // Static M and N curves for troubleshooting
+        this.M = Buffer.from('8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f', 'hex');
+        this.N = Buffer.from('d8bbd68ea4f0b5a2e59031b9cf9af4f4ebea47e98d4bf407062b2f2e5f2d3a99', 'hex');
     }
 
     generateKeyPair() {
@@ -43,10 +44,9 @@ class ImprovedSPAKE2 {
         return { privateKey, publicKey };
     }
 
-    hashPassword(password) {
-        const salt = crypto.randomBytes(16);
+    hashPassword(password, salt) {
         const key = pbkdf2(sha256, password, salt, { c: 10000, dkLen: 32 });
-        return { key, salt };
+        return key;
     }
 
     computeX(isAlice, privateKey, passwordHash) {
@@ -201,11 +201,14 @@ class HyperWormhole {
                 console.log(crayon.yellow('Receiver connected. Starting SPAKE2 exchange...'));
 
                 try {
-                    const { key: passwordHash, salt } = this.spake2.hashPassword(wormholeCode);
+                    const salt = crypto.randomBytes(16);
+                    const passwordHash = this.spake2.hashPassword(wormholeCode, salt);
                     const aliceKeyPair = this.spake2.generateKeyPair();
                     const aliceResult = this.spake2.computeX(true, aliceKeyPair.privateKey, passwordHash);
         
-                    socket.write(Buffer.concat([salt, aliceResult.X]));
+                    // Send salt, M, N, and X
+                    socket.write(Buffer.concat([salt, this.spake2.M, this.spake2.N, aliceResult.X]));
+                    
                     const bobData = await new Promise(resolve => socket.once('data', resolve));
                     const bobX = bobData.slice(0, 32);
         
@@ -270,13 +273,18 @@ class HyperWormhole {
             swarm.once('connection', async (socket) => {
                 console.log(crayon.green('Connected to sender. Starting SPAKE2 exchange...'));
 
-
                 try {
                     const aliceData = await new Promise(resolve => socket.once('data', resolve));
                     const salt = aliceData.slice(0, 16);
-                    const aliceX = aliceData.slice(16, 48);
+                    const M = aliceData.slice(16, 48);
+                    const N = aliceData.slice(48, 80);
+                    const aliceX = aliceData.slice(80, 112);
 
-                    const { key: passwordHash } = this.spake2.hashPassword(wormholeCode);
+                    // Set the received M and N values
+                    this.spake2.M = M;
+                    this.spake2.N = N;
+
+                    const passwordHash = this.spake2.hashPassword(wormholeCode, salt);
                     const bobKeyPair = this.spake2.generateKeyPair();
                     const bobResult = this.spake2.computeX(false, bobKeyPair.privateKey, passwordHash);
 
