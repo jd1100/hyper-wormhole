@@ -11,9 +11,10 @@ const goodbye = require('graceful-goodbye');
 const crayon = require('tiny-crayon');
 const { x25519 } = require('@noble/curves/ed25519');
 const { sha256 } = require('@noble/hashes/sha256');
+const { sha512 } = require('@noble/hashes/sha512');
 const { concatBytes } = require('@noble/hashes/utils');
 const { pbkdf2 } = require('@noble/hashes/pbkdf2');
-const { hmac } = require('@noble/hashes/hmac');
+const * as utils = require('@noble/curves/abstract/utils');
 const os = require('os');
 const { pipeline } = require('stream/promises');
 var singleLineLog = require('single-line-log').stdout;
@@ -32,58 +33,95 @@ const WORDLIST = [
 ];
 
 class ImprovedSPAKE2 {
-    constructor() {
-        // Static M and N curves for troubleshooting
-        this.M = Buffer.from('8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f', 'hex');
-        this.N = Buffer.from('d8bbd68ea4f0b5a2e59031b9cf9af4f4ebea47e98d4bf407062b2f2e5f2d3a99', 'hex');
-    }
+  constructor() {
+    // Generate constant points M and N. These are public parameters of the protocol.
+    // They act as "blinding" factors to prevent offline dictionary attacks.
+    this.M = this.generateConstantPoint("1.2.840.10045.3.1.7 point generation seed (M)");
+    this.N = this.generateConstantPoint("1.2.840.10045.3.1.7 point generation seed (N)");
+  }
 
-    generateKeyPair() {
-        const privateKey = x25519.utils.randomPrivateKey();
-        const publicKey = x25519.getPublicKey(privateKey);
-        return { privateKey, publicKey };
+  generateConstantPoint(seed) {
+    // This method generates a point on the curve from a seed.
+    // It's designed to be deterministic, so both Alice and Bob will generate the same M and N.
+    const seedBuffer = new TextEncoder().encode(seed);
+    for (let i = 1; i < 1000; i++) {
+      const hash = sha512(concatBytes(seedBuffer, Uint8Array.from([i])));
+      const pointCandidate = hash.slice(0, 32);
+      // These bit manipulations ensure the generated point is on the curve
+      pointCandidate[0] &= 248;
+      pointCandidate[31] &= 127;
+      pointCandidate[31] |= 64;
+      try {
+        return x25519.getPublicKey(pointCandidate);
+      } catch (e) {
+        // If the point is not valid, try the next one
+      }
     }
+    throw new Error("Failed to generate constant point");
+  }
 
-    hashPassword(password, salt) {
-        const key = pbkdf2(sha256, password, salt, { c: 10000, dkLen: 32 });
-        return key;
-    }
+  generateKeyPair() {
+    // Generate a new keypair for this session
+    const privateKey = x25519.utils.randomPrivateKey();
+    return { privateKey, publicKey: x25519.getPublicKey(privateKey) };
+  }
 
-    computeX(isAlice, privateKey, passwordHash) {
-        const point = isAlice ? this.M : this.N;
-        const xPrivate = new Uint8Array(32);
-        for (let i = 0; i < 32; i++) {
-            xPrivate[i] = privateKey[i] ^ passwordHash[i];
-        }
-        const X = x25519.getPublicKey(xPrivate);
-        return { xPrivate, X };
-    }
+  hashPassword(password) {
+    // Hash the password using PBKDF2. This slows down potential brute-force attacks.
+    const salt = crypto.randomBytes(16);
+    const key = pbkdf2(sha256, password, salt, { c: 10000, dkLen: 32 });
+    return { key, salt };
+  }
 
-    computeSharedSecret(xPrivate, Y) {
-        return x25519.getSharedSecret(xPrivate, Y);
-    }
+  computeX(isAlice, privateKey, passwordHash) {
+    // Compute the public value to be sent over the network
+    const blind = isAlice ? this.M : this.N;
+    // Combine the private key and password hash
+    const scalar = this.scalarAdd(privateKey, passwordHash);
+    // Compute the public value: g^scalar + blind
+    const X = this.pointAdd(x25519.scalarMultBase(scalar), blind);
+    return { scalar, X };
+  }
 
-    deriveSessionKey(isAlice, X, Y, sharedSecret) {
-        const info = concatBytes(
-            new TextEncoder().encode("SPAKE2 Key Derivation"),
-            isAlice ? X : Y,
-            isAlice ? Y : X
-        );
-        return hmac(sha256, sharedSecret, info);
-    }
+  computeSharedSecret(scalar, Y, isAlice) {
+    // Compute the shared secret from the other party's public value
+    const blind = isAlice ? this.N : this.M;
+    // Remove the blinding factor
+    const unblindedY = this.pointSubtract(Y, blind);
+    // Compute the shared secret
+    return x25519.getSharedSecret(scalar, unblindedY);
+  }
 
-    generateConfirmation(sessionKey) {
-        return hmac(sha256, sessionKey, new TextEncoder().encode("Confirmation"));
+  // Helper function to add two scalars
+  scalarAdd(a, b) {
+    const result = new Uint8Array(32);
+    let carry = 0;
+    for (let i = 0; i < 32; i++) {
+      carry += a[i] + b[i];
+      result[i] = carry & 0xff;
+      carry >>= 8;
     }
+    return result;
+  }
 
-    verifyConfirmation(sessionKey, confirmation) {
-        const expected = this.generateConfirmation(sessionKey);
-        return crypto.timingSafeEqual(expected, confirmation);
-    }
+  // Helper function to add two points
+  pointAdd(a, b) {
+    return this.arrayXOR(a, b);
+  }
 
-    bytesToHex(bytes) {
-        return Buffer.from(bytes).toString('hex');
-    }
+  // Helper function to subtract two points
+  pointSubtract(a, b) {
+    return this.arrayXOR(a, b);
+  }
+
+  // Helper function to XOR two Uint8Arrays
+  arrayXOR(a, b) {
+    return a.map((byte, i) => byte ^ b[i]);
+  }
+
+  bytesToHex(bytes) {
+    return utils.bytesToHex(bytes);
+  }
 }
 
 class HyperWormhole {
@@ -201,8 +239,7 @@ class HyperWormhole {
                 console.log(crayon.yellow('Receiver connected. Starting SPAKE2 exchange...'));
 
                 try {
-                    const salt = crypto.randomBytes(16);
-                    const passwordHash = this.spake2.hashPassword(wormholeCode, salt);
+                    const { key: passwordHash, salt } = this.spake2.hashPassword(wormholeCode);
                     const aliceKeyPair = this.spake2.generateKeyPair();
                     const aliceResult = this.spake2.computeX(true, aliceKeyPair.privateKey, passwordHash);
         
@@ -212,8 +249,8 @@ class HyperWormhole {
                     const bobData = await new Promise(resolve => socket.once('data', resolve));
                     const bobX = bobData.slice(0, 32);
         
-                    const sharedSecret = this.spake2.computeSharedSecret(aliceResult.xPrivate, bobX);
-                    const sessionKey = this.spake2.deriveSessionKey(true, aliceResult.X, bobX, sharedSecret);
+                    const sharedSecret = this.spake2.computeSharedSecret(aliceResult.scalar, bobX, true);
+                    const sessionKey = sharedSecret; // In the new implementation, the shared secret is used directly as the session key
         
                     console.log('SPAKE2 exchange completed.');
         
@@ -280,18 +317,16 @@ class HyperWormhole {
                     const N = aliceData.slice(48, 80);
                     const aliceX = aliceData.slice(80, 112);
 
-                    // Set the received M and N values
-                    this.spake2.M = M;
-                    this.spake2.N = N;
+                    // The new implementation generates M and N internally, so we don't need to set them
 
-                    const passwordHash = this.spake2.hashPassword(wormholeCode, salt);
+                    const { key: passwordHash } = this.spake2.hashPassword(wormholeCode);
                     const bobKeyPair = this.spake2.generateKeyPair();
                     const bobResult = this.spake2.computeX(false, bobKeyPair.privateKey, passwordHash);
 
                     socket.write(bobResult.X);
 
-                    const sharedSecret = this.spake2.computeSharedSecret(bobResult.xPrivate, aliceX);
-                    const sessionKey = this.spake2.deriveSessionKey(false, bobResult.X, aliceX, sharedSecret);
+                    const sharedSecret = this.spake2.computeSharedSecret(bobResult.scalar, aliceX, false);
+                    const sessionKey = sharedSecret; // In the new implementation, the shared secret is used directly as the session key
 
                     console.log('SPAKE2 exchange completed.');
 
