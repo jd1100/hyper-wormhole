@@ -3,6 +3,9 @@ const Hyperswarm = require('hyperswarm');
 const Corestore = require('corestore');
 const Hyperdrive = require('hyperdrive');
 const HypercoreId = require('hypercore-id-encoding');
+const Protomux = require('protomux');
+const SecretStream = require('@hyperswarm/secret-stream');
+const c = require('compact-encoding');
 const fs = require('fs').promises;
 const fsSync = require('fs');
 const path = require('path');
@@ -11,16 +14,14 @@ const goodbye = require('graceful-goodbye');
 const crayon = require('tiny-crayon');
 const { x25519 } = require('@noble/curves/ed25519');
 const { sha256 } = require('@noble/hashes/sha256');
-const { sha512 } = require('@noble/hashes/sha512');
 const { concatBytes } = require('@noble/hashes/utils');
 const { pbkdf2 } = require('@noble/hashes/pbkdf2');
-const utils = require('@noble/curves/abstract/utils');
+const { hmac } = require('@noble/hashes/hmac');
 const os = require('os');
 const { pipeline } = require('stream/promises');
 var singleLineLog = require('single-line-log').stdout;
 process.stdout.isTTY = true;
 
-const SERVER_TOPIC = 'hyperwormhole-server-topic';
 const WORDLIST = [
     'aardvark', 'absurd', 'accrue', 'acme', 'adrift', 'adult', 'afflict', 'ahead', 'aimless', 'algol', 'allow', 'alone',
     'ammo', 'ancient', 'apple', 'artist', 'assume', 'athens', 'atlas', 'aztec', 'baboon', 'backfield', 'backward', 'banjo',
@@ -32,96 +33,66 @@ const WORDLIST = [
     'eating', 'edict', 'egghead', 'eightball', 'endorse', 'endow', 'enlist', 'erase', 'escape', 'exceed', 'eyeglass', 'eyetooth'
 ];
 
+// Protocol constants
+const PROTOCOLS = {
+    KEY_EXCHANGE: 'hyperwormhole/key-exchange/1.0.0',
+    DRIVE_EXCHANGE: 'hyperwormhole/drive-exchange/1.0.0',
+    CONTROL: 'hyperwormhole/control/1.0.0'
+};
+
 class ImprovedSPAKE2 {
-  constructor() {
-    // Generate constant points M and N. These are public parameters of the protocol.
-    // They act as "blinding" factors to prevent offline dictionary attacks.
-    this.M = this.generateConstantPoint("1.2.840.10045.3.1.7 point generation seed (M)");
-    this.N = this.generateConstantPoint("1.2.840.10045.3.1.7 point generation seed (N)");
-  }
-
-  generateConstantPoint(seed) {
-    // This method generates a point on the curve from a seed.
-    // It's designed to be deterministic, so both Alice and Bob will generate the same M and N.
-    const seedBuffer = new TextEncoder().encode(seed);
-    for (let i = 1; i < 1000; i++) {
-      const hash = sha512(concatBytes(seedBuffer, Uint8Array.from([i])));
-      const pointCandidate = hash.slice(0, 32);
-      // These bit manipulations ensure the generated point is on the curve
-      pointCandidate[0] &= 248;
-      pointCandidate[31] &= 127;
-      pointCandidate[31] |= 64;
-      try {
-        return x25519.getPublicKey(pointCandidate);
-      } catch (e) {
-        // If the point is not valid, try the next one
-      }
+    constructor() {
+        this.M = x25519.utils.randomPrivateKey();
+        this.N = x25519.utils.randomPrivateKey();
     }
-    throw new Error("Failed to generate constant point");
-  }
 
-  generateKeyPair() {
-    // Generate a new keypair for this session
-    const privateKey = x25519.utils.randomPrivateKey();
-    return { privateKey, publicKey: x25519.getPublicKey(privateKey) };
-  }
-
-  hashPassword(password) {
-    // Hash the password using PBKDF2. This slows down potential brute-force attacks.
-    const salt = crypto.randomBytes(16);
-    const key = pbkdf2(sha256, password, salt, { c: 10000, dkLen: 32 });
-    return { key, salt };
-  }
-
-  computeX(isAlice, privateKey, passwordHash) {
-    // Compute the public value to be sent over the network
-    const blind = isAlice ? this.M : this.N;
-    // Combine the private key and password hash
-    const scalar = this.scalarAdd(privateKey, passwordHash);
-    // Compute the public value: g^scalar + blind
-    const X = this.pointAdd(x25519.scalarMultBase(scalar), blind);
-    return { scalar, X };
-  }
-
-  computeSharedSecret(scalar, Y, isAlice) {
-    // Compute the shared secret from the other party's public value
-    const blind = isAlice ? this.N : this.M;
-    // Remove the blinding factor
-    const unblindedY = this.pointSubtract(Y, blind);
-    // Compute the shared secret
-    return x25519.getSharedSecret(scalar, unblindedY);
-  }
-
-  // Helper function to add two scalars
-  scalarAdd(a, b) {
-    const result = new Uint8Array(32);
-    let carry = 0;
-    for (let i = 0; i < 32; i++) {
-      carry += a[i] + b[i];
-      result[i] = carry & 0xff;
-      carry >>= 8;
+    generateKeyPair() {
+        const privateKey = x25519.utils.randomPrivateKey();
+        const publicKey = x25519.getPublicKey(privateKey);
+        return { privateKey, publicKey };
     }
-    return result;
-  }
 
-  // Helper function to add two points
-  pointAdd(a, b) {
-    return this.arrayXOR(a, b);
-  }
+    hashPassword(password) {
+        const salt = crypto.randomBytes(16);
+        const key = pbkdf2(sha256, password, salt, { c: 10000, dkLen: 32 });
+        return { key, salt };
+    }
 
-  // Helper function to subtract two points
-  pointSubtract(a, b) {
-    return this.arrayXOR(a, b);
-  }
+    computeX(isAlice, privateKey, passwordHash) {
+        const point = isAlice ? this.M : this.N;
+        const xPrivate = new Uint8Array(32);
+        for (let i = 0; i < 32; i++) {
+            xPrivate[i] = privateKey[i] ^ passwordHash[i];
+        }
+        const X = x25519.getPublicKey(xPrivate);
+        return { xPrivate, X };
+    }
 
-  // Helper function to XOR two Uint8Arrays
-  arrayXOR(a, b) {
-    return a.map((byte, i) => byte ^ b[i]);
-  }
+    computeSharedSecret(xPrivate, Y) {
+        return x25519.getSharedSecret(xPrivate, Y);
+    }
 
-  bytesToHex(bytes) {
-    return utils.bytesToHex(bytes);
-  }
+    deriveSessionKey(isAlice, X, Y, sharedSecret) {
+        const info = concatBytes(
+            new TextEncoder().encode("SPAKE2 Key Derivation"),
+            isAlice ? X : Y,
+            isAlice ? Y : X
+        );
+        return hmac(sha256, sharedSecret, info);
+    }
+
+    generateConfirmation(sessionKey) {
+        return hmac(sha256, sessionKey, new TextEncoder().encode("Confirmation"));
+    }
+
+    verifyConfirmation(sessionKey, confirmation) {
+        const expected = this.generateConfirmation(sessionKey);
+        return crypto.timingSafeEqual(expected, confirmation);
+    }
+
+    bytesToHex(bytes) {
+        return Buffer.from(bytes).toString('hex');
+    }
 }
 
 class HyperWormhole {
@@ -132,31 +103,6 @@ class HyperWormhole {
         this.totalSize = 0;
         this.transferredSize = 0;
         this.monitors = new Set();
-        this.serverSwarm = null;
-    }
-
-    async startServer() {
-        console.log(crayon.cyan('Starting HyperWormhole server...'));
-        this.serverSwarm = new Hyperswarm();
-        goodbye(() => this.serverSwarm.destroy());
-
-        const serverTopic = crypto.createHash('sha256').update(SERVER_TOPIC).digest();
-        this.serverSwarm.join(serverTopic, { server: true, client: false });
-
-        this.serverSwarm.on('connection', (socket) => {
-            console.log(crayon.green('New peer connected to server'));
-            socket.on('data', (data) => {
-                if (data.length === 32) {
-                    const driveDiscoveryKey = data.toString('hex');
-                    console.log(crayon.yellow(`Received drive discovery key: ${driveDiscoveryKey}`));
-                    this.serverSwarm.join(Buffer.from(driveDiscoveryKey, 'hex'), { server: true, client: true });
-                    console.log(crayon.green(`Joined drive discovery key: ${driveDiscoveryKey}`));
-                }
-            });
-        });
-
-        await this.serverSwarm.listen();
-        console.log(crayon.green('HyperWormhole server is running and listening for connections'));
     }
 
     async createTempCorestore() {
@@ -176,12 +122,125 @@ class HyperWormhole {
         }
     }
 
+    async performKeyAndDriveExchange(mux, wormholeCode, drive, isAlice) {
+        return new Promise(async (resolve, reject) => {
+            try {
+                const { key: passwordHash, salt } = this.spake2.hashPassword(wormholeCode);
+                const keyPair = this.spake2.generateKeyPair();
+                const result = this.spake2.computeX(isAlice, keyPair.privateKey, passwordHash);
+
+                let sessionKey = null;
+                let driveKeyResult = null;
+
+                // Create key exchange channel
+                const keyExchangeChannel = mux.createChannel({
+                    protocol: PROTOCOLS.KEY_EXCHANGE,
+                    onopen() {
+                        console.log("Key exchange channel opened", (isAlice ? 'Alice' : 'Bob'));
+                        if (isAlice) {
+                            console.log('Alice sending salt + X value');
+                            const payload = Buffer.concat([salt, result.X]);
+                            aliceToBox.send(payload);
+                        }
+                    },
+                    onclose() {
+                        console.log('Key exchange channel closed', (isAlice ? 'Alice' : 'Bob'));
+                    }
+                });
+
+                // Create drive exchange channel at the same time
+                const driveChannel = mux.createChannel({
+                    protocol: PROTOCOLS.DRIVE_EXCHANGE,
+                    onopen() {
+                        console.log('Drive exchange channel opened', (isAlice ? 'Alice' : 'Bob'));
+                    },
+                    onclose() {
+                        console.log('Drive exchange channel closed', (isAlice ? 'Alice' : 'Bob'));
+                    }
+                });
+
+                // Key exchange messages
+                const aliceToBox = keyExchangeChannel.addMessage({
+                    encoding: c.binary,
+                    onmessage: isAlice ? () => {} : (aliceData) => {
+                        try {
+                            console.log('Bob received Alice\'s data, processing...');
+                            const receivedSalt = aliceData.slice(0, 16);
+                            const aliceX = aliceData.slice(16, 48);
+                            
+                            const sharedSecret = this.spake2.computeSharedSecret(result.xPrivate, aliceX);
+                            sessionKey = this.spake2.deriveSessionKey(false, result.X, aliceX, sharedSecret);
+                            
+                            console.log('Bob computed session key, sending X value back');
+                            bobToAlice.send(result.X);
+                        } catch (error) {
+                            console.error('Bob error:', error);
+                            reject(error);
+                        }
+                    }
+                });
+
+                const bobToAlice = keyExchangeChannel.addMessage({
+                    encoding: c.binary,
+                    onmessage: isAlice ? (bobX) => {
+                        try {
+                            console.log('Alice received Bob\'s X value, computing session key');
+                            const sharedSecret = this.spake2.computeSharedSecret(result.xPrivate, bobX);
+                            sessionKey = this.spake2.deriveSessionKey(true, result.X, bobX, sharedSecret);
+                            console.log('Alice computed session key successfully');
+                            
+                            // Alice sends drive key immediately after computing session key
+                            console.log('Alice encrypting and sending drive key...');
+                            const encryptedDriveKey = this.encrypt(drive.key, sessionKey);
+                            sendDriveKey.send(encryptedDriveKey);
+                        } catch (error) {
+                            console.error('Alice error:', error);
+                            reject(error);
+                        }
+                    } : () => {}
+                });
+
+                // Drive exchange messages
+                const sendDriveKey = driveChannel.addMessage({
+                    encoding: c.binary,
+                    onmessage: isAlice ? () => {} : (encryptedDriveKey) => {
+                        try {
+                            console.log('Bob received encrypted drive key, decrypting...');
+                            driveKeyResult = this.decrypt(encryptedDriveKey, sessionKey);
+                            console.log('Bob successfully decrypted drive key!');
+                            resolve({ sessionKey, driveKey: driveKeyResult });
+                        } catch (error) {
+                            console.error('Bob drive key decryption error:', error);
+                            reject(error);
+                        }
+                    }
+                });
+
+                // Open both channels
+                keyExchangeChannel.open();
+                driveChannel.open();
+
+                // Alice resolves after sending drive key
+                if (isAlice) {
+                    setTimeout(() => {
+                        if (sessionKey) {
+                            resolve({ sessionKey, driveKey: null });
+                        }
+                    }, 2000);
+                }
+
+            } catch (error) {
+                console.error('Exchange setup error:', error);
+                reject(error);
+            }
+        });
+    }
 
     async sendData(filePath) {
         const wormholeCode = HyperWormhole.generateWormholeCode();
         const initialTopic = this.wormholeCodeToTopic(wormholeCode);
 
-        console.log(`Your wormhole code is: ${crayon.magenta(wormholeCode)}`);
+        console.log("Your wormhole code is:", crayon.magenta(wormholeCode));
         console.log('Waiting for receiver to connect...');
 
         const store = await this.createTempCorestore();
@@ -218,198 +277,241 @@ class HyperWormhole {
             }
         }
 
-        const swarm = new Hyperswarm({ maxPeers: 10 });
-        goodbye(() => swarm.destroy());
+        // Phase 1: Key exchange swarm
+        const keyExchangeSwarm = new Hyperswarm({ maxPeers: 10 });
+        goodbye(() => keyExchangeSwarm.destroy());
 
-        // Join the server topic to publish the drive discovery key
-        const serverTopic = crypto.createHash('sha256').update(SERVER_TOPIC).digest();
-        const serverDiscovery = swarm.join(serverTopic, { server: false, client: true });
-        
-        serverDiscovery.flushed().then(() => {
-            console.log(crayon.cyan('Connected to HyperWormhole server. Publishing drive discovery key.'));
-            for (const connection of swarm.connections) {
-                connection.write(drive.discoveryKey);
-            }
-        });
+        const sessionKey = await new Promise((resolve, reject) => {
+            const initialDiscovery = keyExchangeSwarm.join(initialTopic, { server: true, client: true });
 
-        return new Promise((resolve) => {
-            const initialDiscovery = swarm.join(initialTopic, { server: true, client: true });
-
-            swarm.once('connection', async (socket) => {
+            keyExchangeSwarm.once('connection', async (rawSocket) => {
                 console.log(crayon.yellow('Receiver connected. Starting SPAKE2 exchange...'));
 
                 try {
-                    const { key: passwordHash, salt } = this.spake2.hashPassword(wormholeCode);
-                    const aliceKeyPair = this.spake2.generateKeyPair();
-                    const aliceResult = this.spake2.computeX(true, aliceKeyPair.privateKey, passwordHash);
-        
-                    // Send salt, M, N, and X
-                    socket.write(Buffer.concat([salt, this.spake2.M, this.spake2.N, aliceResult.X]));
-                    
-                    const bobData = await new Promise(resolve => socket.once('data', resolve));
-                    const bobX = bobData.slice(0, 32);
-        
-                    const sharedSecret = this.spake2.computeSharedSecret(aliceResult.scalar, bobX, true);
-                    const sessionKey = sharedSecret; // In the new implementation, the shared secret is used directly as the session key
-        
-                    console.log('SPAKE2 exchange completed.');
-        
-                    // Encrypt the drive key with the session key
-                    const encryptedDriveKey = this.encrypt(drive.key, sessionKey);
-        
-                    // Send the encrypted drive key
-                    socket.write(encryptedDriveKey);
-        
-                    console.log(crayon.green('Encrypted drive key sent to receiver. Starting file transfer...'));
+                    // Wrap with SecretStream for encryption
+                    const socket = new SecretStream(true, rawSocket);
 
-                    socket.end();
-                    initialDiscovery.destroy();
+                    // Create Protomux instance
+                    const mux = Protomux.from(socket);
 
-                    // Join the Hyperdrive's discovery swarm after the initial exchange
-                    swarm.join(drive.discoveryKey);
-                    swarm.on('connection', (peerSocket) => {
-                        console.log(crayon.yellow('Peer connected. Starting replication...'));
-                        drive.replicate(peerSocket);
+                    // Perform combined key and drive exchange
+                    const result = await this.performKeyAndDriveExchange(mux, wormholeCode, drive, true);
+                    console.log('SPAKE2 and drive exchange completed.');
+                    console.log(crayon.green('Drive key sent to receiver. Starting file transfer...'));
 
-                        // Listen for completion signal from receiver
-                        peerSocket.on('data', (data) => {
-                            if (data.toString() === 'TRANSFER_COMPLETE') {
-                                console.log(crayon.green('File transfer completed. Shutting down...'));
-                                resolve();
-                            }
-                        });
-                    });
+                    // Close the key exchange connection after a delay
+                    setTimeout(() => {
+                        socket.end();
+                        initialDiscovery.destroy();
+                        keyExchangeSwarm.destroy();
+                        resolve(result.sessionKey);
+                    }, 2000);
 
-                    // Add progress tracking
-                    drive.core.on('append', () => {
-                        this.transferredSize = drive.core.byteLength;
-                        this.updateProgressBar('Uploading');
-                    });
-
-                    await swarm.flush();
-                    console.log(crayon.green('Ready for receiver. Waiting...'));
                 } catch (error) {
-                    console.error(crayon.red('Error in sendData:'), error);
-                    resolve();
+                    console.error(crayon.red('Error in key exchange:'), error);
+                    reject(error);
                 }
             });
+        });
+
+        // Phase 2: Replication swarm (separate instance)
+        const replicationSwarm = new Hyperswarm({ maxPeers: 10 });
+        goodbye(() => replicationSwarm.destroy());
+
+        return new Promise((resolve) => {
+            console.log('Starting replication phase...');
+            
+            // Use findingPeers pattern
+            const done = drive.findingPeers();
+            
+            replicationSwarm.on('connection', (socket) => {
+                console.log(crayon.yellow('Peer connected for replication...'));
+                
+                // Use the official pattern
+                drive.replicate(socket);
+                
+                // Simple completion detection - check for drive synchronization
+                const checkCompletion = setInterval(() => {
+                    if (drive.core.peers && drive.core.peers.length > 0) {
+                        // Check if peer has downloaded the content
+                        for (const peer of drive.core.peers) {
+                            if (peer.remoteLength > 0) {
+                                console.log(crayon.green('File transfer completed. Shutting down...'));
+                                clearInterval(checkCompletion);
+                                resolve();
+                                break;
+                            }
+                        }
+                    }
+                }, 1000);
+                
+                // Timeout after 30 seconds
+                setTimeout(() => {
+                    clearInterval(checkCompletion);
+                    console.log(crayon.green('Transfer timeout reached. Shutting down...'));
+                    resolve();
+                }, 30000);
+            });
+
+            replicationSwarm.join(drive.discoveryKey);
+            replicationSwarm.flush().then(done, done);
+            console.log(crayon.green('Ready for receiver. Waiting...'));
         });
     }
 
     async receiveData(wormholeCode, outputPath) {
         const initialTopic = this.wormholeCodeToTopic(wormholeCode);
-    
+
         console.log(crayon.cyan('Connecting to sender...'));
-    
-        const swarm = new Hyperswarm({ maxPeers: 10 });
-        goodbye(() => swarm.destroy());
-    
-        const driveKey = await new Promise((resolve, reject) => {
-            const initialDiscovery = swarm.join(initialTopic, { server: true, client: true });
 
-            swarm.once('connection', async (socket) => {
-                console.log(crayon.green('Connected to sender. Starting SPAKE2 exchange...'));
+        // Phase 1: Key exchange swarm
+        const keyExchangeSwarm = new Hyperswarm({ maxPeers: 10 });
+        goodbye(() => keyExchangeSwarm.destroy());
 
-                try {
-                    const aliceData = await new Promise(resolve => socket.once('data', resolve));
-                    const salt = aliceData.slice(0, 16);
-                    const M = aliceData.slice(16, 48);
-                    const N = aliceData.slice(48, 80);
-                    const aliceX = aliceData.slice(80, 112);
+        let driveKey;
+        try {
+            driveKey = await new Promise((resolve, reject) => {
+                const initialDiscovery = keyExchangeSwarm.join(initialTopic, { server: true, client: true });
 
-                    // The new implementation generates M and N internally, so we don't need to set them
+                keyExchangeSwarm.once('connection', async (rawSocket) => {
+                    console.log(crayon.green('Connected to sender. Starting SPAKE2 exchange...'));
 
-                    const { key: passwordHash } = this.spake2.hashPassword(wormholeCode);
-                    const bobKeyPair = this.spake2.generateKeyPair();
-                    const bobResult = this.spake2.computeX(false, bobKeyPair.privateKey, passwordHash);
+                    try {
+                        // Wrap with SecretStream for encryption
+                        const socket = new SecretStream(false, rawSocket);
 
-                    socket.write(bobResult.X);
+                        // Create Protomux instance
+                        const mux = Protomux.from(socket);
 
-                    const sharedSecret = this.spake2.computeSharedSecret(bobResult.scalar, aliceX, false);
-                    const sessionKey = sharedSecret; // In the new implementation, the shared secret is used directly as the session key
+                        // Perform combined key and drive exchange
+                        const result = await this.performKeyAndDriveExchange(mux, wormholeCode, null, false);
+                        const driveKey = result.driveKey;
+                        console.log('SPAKE2 and drive exchange completed.');
+                        console.log(crayon.green('Successfully received drive key!'));
+                        console.log('Drive key:', HypercoreId.encode(driveKey));
 
-                    console.log('SPAKE2 exchange completed.');
+                        // Clean up key exchange immediately
+                        socket.end();
+                        initialDiscovery.destroy();
+                        keyExchangeSwarm.destroy();
+                        resolve(driveKey);
+                    } catch (error) {
+                        console.error('Error in key exchange:', error);
+                        reject(error);
+                    }
+                });
 
-                    // Receive the encrypted drive key
-                    const encryptedDriveKey = await new Promise(resolve => socket.once('data', resolve));
-
-                    // Decrypt the drive key
-                    const driveKey = this.decrypt(encryptedDriveKey, sessionKey);
-
-                    console.log(crayon.green('Received and decrypted drive key. Starting file transfer...'));
-                    console.log('Drive key:', HypercoreId.encode(driveKey));
-
-                    socket.end();
-                    initialDiscovery.destroy();
-                    resolve(driveKey);
-                } catch (error) {
-                    reject(error);
-                }
+                // Add timeout for key exchange
+                setTimeout(() => {
+                    reject(new Error('Key exchange timeout'));
+                }, 30000);
             });
-        });
-    
+        } catch (error) {
+            console.error('Key exchange failed:', error);
+            return;
+        }
+
+        console.log(crayon.green('Key exchange complete. Setting up replication...'));
+
+        // Phase 2: Replication with separate swarm
         const store = await this.createTempCorestore();
         const drive = new Hyperdrive(store, driveKey);
-    
+
         goodbye(async () => {
             await drive.close();
             await store.close();
             await this.cleanup();
         });
-    
+
         await drive.ready();
-        console.log('Drive is ready. Starting download...');
-    
-        // Join the Hyperdrive's discovery swarm
-        swarm.join(drive.discoveryKey);
-        console.log(`Joined drive discovery key: ${drive.discoveryKey.toString('hex')}`);
-    
-        let senderSocket;
-        swarm.on('connection', (socket) => {
-            console.log(crayon.yellow('Connected to sender. Starting replication...'));
+        console.log('Drive is ready. Discovery key:', drive.discoveryKey.toString('hex'));
+
+        const replicationSwarm = new Hyperswarm({ maxPeers: 10 });
+        goodbye(() => replicationSwarm.destroy());
+
+        // Use findingPeers pattern for proper connection handling
+        const done = drive.findingPeers();
+
+        let connected = false;
+        replicationSwarm.on('connection', (socket) => {
+            console.log(crayon.yellow('Connected to sender for replication...'));
+            connected = true;
+            // Use the official pattern
             drive.replicate(socket);
-            senderSocket = socket;
         });
-    
-        await swarm.flush();
-        console.log('Swarm flushed. Waiting for files...');
-    
-        // Add a delay to allow for initial replication
-        console.log('Waiting for initial replication...');
-        await new Promise(resolve => setTimeout(resolve, 5000));
-    
-        const maxRetries = 3;
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            console.log(`Download attempt ${attempt} of ${maxRetries}`);
-            
-            console.log('Drive state before download:');
-    
-            try {
-                await this.downloadDriveContents(drive, outputPath);
-                console.log(crayon.green('File transfer completed successfully'));
-                break;
-            } catch (error) {
-                console.error(`Error in download attempt ${attempt}:`, error);
-                
-                if (attempt === maxRetries) {
-                    console.error('Max retries reached. Download failed.');
-                } else {
-                    console.log('Waiting before next attempt...');
-                    await new Promise(resolve => setTimeout(resolve, 5000));
-                }
-            }
+
+        console.log('Joining replication swarm...');
+        replicationSwarm.join(drive.discoveryKey);
+        await replicationSwarm.flush().then(done, done);
+        console.log('Swarm flushed and peers found. Waiting for replication connection...');
+
+        // Wait for connection
+        let waitCount = 0;
+        while (!connected && waitCount < 15) {
+            console.log(`Waiting for replication connection... (${waitCount + 1}/15)`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            waitCount++;
         }
-    
-        // Signal completion to sender
-        if (senderSocket) {
-            senderSocket.write('TRANSFER_COMPLETE');
+
+        if (!connected) {
+            console.error('Failed to connect for replication');
+            return;
         }
-    
-        await drive.close();
-        await store.close();
-        await this.cleanup();
-    
-        swarm.destroy();
+
+        console.log('Replication connected! Attempting to download files...');
+        
+        try {
+            await this.downloadDriveContents(drive, outputPath);
+            console.log(crayon.green('File transfer completed successfully'));
+        } catch (error) {
+            console.error("Download failed:", error);
+        }
+
+        // Cleanup with better error handling
+        console.log('Starting cleanup...');
+        
+        // First destroy the swarm to close all connections
+        try {
+            replicationSwarm.destroy();
+            console.log('Replication swarm destroyed');
+        } catch (error) {
+            console.log('Swarm destroy error (non-critical):', error.message);
+        }
+
+        // Wait a bit for connections to close cleanly
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        // Close drive with timeout
+        try {
+            const driveClosePromise = drive.close();
+            const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Drive close timeout')), 5000)
+            );
+            await Promise.race([driveClosePromise, timeoutPromise]);
+            console.log('Drive closed successfully');
+        } catch (error) {
+            console.log('Drive close error (non-critical):', error.message);
+        }
+
+        // Close store with timeout
+        try {
+            const storeClosePromise = store.close();
+            const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Store close timeout')), 5000)
+            );
+            await Promise.race([storeClosePromise, timeoutPromise]);
+            console.log('Store closed successfully');
+        } catch (error) {
+            console.log('Store close error (non-critical):', error.message);
+        }
+
+        // Final cleanup
+        try {
+            await this.cleanup();
+            console.log('Cleanup completed');
+        } catch (error) {
+            console.log('Cleanup error (non-critical):', error.message);
+        }
     }
 
     async addFileToDrive(drive, filePath, drivePath) {
@@ -418,9 +520,9 @@ class HyperWormhole {
 
         try {
             await pipeline(readStream, writeStream);
-            console.log(crayon.green(`Added file: ${drivePath}`));
+            console.log(crayon.green("Added file:", drivePath));
         } catch (error) {
-            console.error(crayon.red(`Error adding file ${drivePath}:`, error));
+            console.error(crayon.red("Error adding file", drivePath, ":", error));
             throw error;
         }
     }
@@ -438,68 +540,79 @@ class HyperWormhole {
         }
     }
 
-    async addFileToDrive(drive, filePath, drivePath) {
-        const readStream = fsSync.createReadStream(filePath);
-        const writeStream = drive.createWriteStream(drivePath);
-
-        try {
-            await pipeline(readStream, writeStream);
-            console.log(crayon.green(`Added file: ${drivePath}`));
-        } catch (error) {
-            console.error(crayon.red(`Error adding file ${drivePath}:`, error));
-            throw error;
-        }
-    }
-
     async downloadDriveContents(drive, outputPath) {
-        console.log(`Starting downloadDriveContents to ${outputPath}`);
+        console.log("Starting downloadDriveContents to", outputPath);
+        
+        // Wait for drive to have some content
+        console.log('Waiting for drive replication...');
+        let attempts = 0;
+        const maxWaitAttempts = 30; // 30 seconds total
+        
+        while (attempts < maxWaitAttempts) {
+            try {
+                // Try to list files - this will trigger downloading
+                const entries = [];
+                for await (const entry of drive.list({ recursive: true })) {
+                    entries.push(entry);
+                }
+                
+                if (entries.length > 0) {
+                    console.log(`Found ${entries.length} entries, starting download...`);
+                    break;
+                } else {
+                    console.log(`Attempt ${attempts + 1}: No entries found yet, waiting...`);
+                }
+            } catch (error) {
+                console.log(`Attempt ${attempts + 1}: Error listing, waiting...`, error.message);
+            }
+            
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            attempts++;
+        }
+        
+        if (attempts >= maxWaitAttempts) {
+            throw new Error('Timeout waiting for drive content');
+        }
+
         let fileCount = 0;
         let totalSize = 0;
-    
-    
+
         for await (const entry of drive.list({ recursive: true })) {
             if (!entry.value.blob) {
-                console.log(`Skipping non-blob entry: ${entry.key}`);
+                console.log("Skipping non-blob entry:", entry.key);
                 continue;
             }
-    
+
             fileCount++;
-            console.log(`Processing file ${fileCount}: ${entry.key}`);
-            
+            console.log("Processing file", fileCount, ":", entry.key);
+
             const filePath = path.join(outputPath, entry.key);
             await fs.mkdir(path.dirname(filePath), { recursive: true });
-    
-            try {
-                const fileMonitor = drive.monitor(entry.key);
-                await fileMonitor.ready();
 
-                fileMonitor.on('update', () => {
-                    this.updateProgressBar('Downloading', fileMonitor.downloadStats);
-                });
-                totalSize += fileMonitor.downloadStats.targetBytes;
-                console.log(`File size: ${fileMonitor.downloadStats.targetBytes} bytes`);
-    
-                const readStream = drive.createReadStream(entry.key);
-                const writeStream = fsSync.createWriteStream(filePath);
-    
-                await pipeline(readStream, writeStream);
-    
-                console.log(`\nDownloaded and saved: ${crayon.yellow(filePath)}`);
-                fileMonitor.close();
+            try {
+                // Use drive.get() instead of streams for better reliability
+                console.log("Downloading file content...");
+                const content = await drive.get(entry.key);
+                
+                if (content) {
+                    await fs.writeFile(filePath, content);
+                    console.log("Downloaded and saved:", crayon.yellow(filePath));
+                    totalSize += content.length;
+                } else {
+                    console.log("No content received for:", entry.key);
+                }
             } catch (error) {
-                console.error(`Error downloading file ${entry.key}:`, error);
-                await fs.unlink(filePath).catch(() => {});
+                console.error("Error downloading file", entry.key, ":", error);
                 throw error; // Rethrow to trigger retry
             }
         }
-    
-        console.log(`Download complete. Total files: ${fileCount}, Total size: ${totalSize} bytes`);
-        
+
+        console.log("Download complete. Total files:", fileCount, "Total size:", totalSize, "bytes");
+
         if (fileCount === 0) {
             throw new Error('No files were downloaded');
         }
     }
-    
 
     wormholeCodeToTopic(code) {
         return crypto.createHash('sha256').update(code).digest();
@@ -553,9 +666,10 @@ class HyperWormhole {
         const speed = this.formatSize(stats.speed) + '/s';
         singleLineLog(`${action}: [${bar}] ${percentage}% | ${this.formatSize(stats.monitoringBytes)} / ${this.formatSize(stats.targetBytes)} | ${speed}`);
     }
+
     formatSize(bytes) {
         if (typeof bytes !== 'number' || isNaN(bytes)) {
-            return '0 B';  // or 'Unknown size'
+            return '0 B';
         }
         const units = ['B', 'KB', 'MB', 'GB', 'TB'];
         let size = Math.abs(bytes);
@@ -573,7 +687,7 @@ function createCLI() {
 
     program
         .version('1.0.0')
-        .description('HyperWormhole - Secure P2P file transfer');
+        .description('HyperWormhole - Secure P2P file transfer with Protomux');
 
     program
         .command('send <path>')
@@ -606,23 +720,9 @@ function createCLI() {
             }
         });
 
-    program
-        .command('server')
-        .description('Run as a HyperWormhole server')
-        .action(async () => {
-            const wormhole = new HyperWormhole();
-            try {
-                await wormhole.startServer();
-                // Keep the process running
-                process.stdin.resume();
-            } catch (error) {
-                console.error(crayon.red('Error starting server:'), error);
-                process.exit(1);
-            }
-        });
-
     return program;
 }
+
 if (require.main === module) {
     const cli = createCLI();
     cli.parse(process.argv);

@@ -3,3 +3,7 @@ node_modules/**
 tst
 package-lock.json
 test-pear/node_modules/**
+
+.aider*
+test-pear/TwitVd.com_1724592504.mp4
+bun.lock
