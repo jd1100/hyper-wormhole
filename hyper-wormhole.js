@@ -1,4 +1,4 @@
-const crypto = require('crypto');
+const nodeCrypto = require('crypto');
 const Hyperswarm = require('hyperswarm');
 const Corestore = require('corestore');
 const Hyperdrive = require('hyperdrive');
@@ -53,7 +53,7 @@ class ImprovedSPAKE2 {
     }
 
     hashPassword(password) {
-        const salt = crypto.randomBytes(16);
+        const salt = nodeCrypto.randomBytes(16);
         const key = pbkdf2(sha256, password, salt, { c: 10000, dkLen: 32 });
         return { key, salt };
     }
@@ -87,7 +87,7 @@ class ImprovedSPAKE2 {
 
     verifyConfirmation(sessionKey, confirmation) {
         const expected = this.generateConfirmation(sessionKey);
-        return crypto.timingSafeEqual(expected, confirmation);
+        return nodeCrypto.timingSafeEqual(expected, confirmation);
     }
 
     bytesToHex(bytes) {
@@ -460,11 +460,13 @@ class HyperWormhole {
 
         console.log('Replication connected! Attempting to download files...');
         
+        let downloadResult = null;
         try {
-            await this.downloadDriveContents(drive, outputPath);
-            console.log(crayon.green('File transfer completed successfully'));
+            downloadResult = await this.downloadDriveContents(drive, outputPath);
+            console.log(crayon.green(`File transfer completed successfully! Downloaded ${downloadResult.fileCount} files (${this.formatSize(downloadResult.totalSize)})`));
         } catch (error) {
             console.error("Download failed:", error);
+            console.log("Attempting to clean up and exit...");
         }
 
         // Cleanup with better error handling
@@ -512,6 +514,15 @@ class HyperWormhole {
         } catch (error) {
             console.log('Cleanup error (non-critical):', error.message);
         }
+
+        // Exit gracefully
+        if (downloadResult) {
+            console.log(crayon.green('HyperWormhole transfer completed successfully! 🎉'));
+            process.exit(0);
+        } else {
+            console.log(crayon.red('HyperWormhole transfer failed.'));
+            process.exit(1);
+        }
     }
 
     async addFileToDrive(drive, filePath, drivePath) {
@@ -543,27 +554,41 @@ class HyperWormhole {
     async downloadDriveContents(drive, outputPath) {
         console.log("Starting downloadDriveContents to", outputPath);
         
-        // Wait for drive to have some content
+        // Wait for drive to have some content and be properly replicated
         console.log('Waiting for drive replication...');
         let attempts = 0;
         const maxWaitAttempts = 30; // 30 seconds total
         
         while (attempts < maxWaitAttempts) {
             try {
-                // Try to list files - this will trigger downloading
-                const entries = [];
-                for await (const entry of drive.list({ recursive: true })) {
-                    entries.push(entry);
+                // Check if we have peers and they have content
+                if (drive.core.peers && drive.core.peers.length > 0) {
+                    let hasRemoteContent = false;
+                    for (const peer of drive.core.peers) {
+                        if (peer.remoteLength > 0) {
+                            hasRemoteContent = true;
+                            console.log(`Peer has ${peer.remoteLength} blocks available`);
+                            break;
+                        }
+                    }
+                    
+                    if (hasRemoteContent) {
+                        // Try to list files - this will trigger downloading
+                        const entries = [];
+                        for await (const entry of drive.list({ recursive: true })) {
+                            entries.push(entry);
+                        }
+                        
+                        if (entries.length > 0) {
+                            console.log(`Found ${entries.length} entries, starting download...`);
+                            break;
+                        }
+                    }
                 }
                 
-                if (entries.length > 0) {
-                    console.log(`Found ${entries.length} entries, starting download...`);
-                    break;
-                } else {
-                    console.log(`Attempt ${attempts + 1}: No entries found yet, waiting...`);
-                }
+                console.log(`Attempt ${attempts + 1}: Waiting for replication...`);
             } catch (error) {
-                console.log(`Attempt ${attempts + 1}: Error listing, waiting...`, error.message);
+                console.log(`Attempt ${attempts + 1}: Error checking replication:`, error.message);
             }
             
             await new Promise(resolve => setTimeout(resolve, 1000));
@@ -571,7 +596,7 @@ class HyperWormhole {
         }
         
         if (attempts >= maxWaitAttempts) {
-            throw new Error('Timeout waiting for drive content');
+            throw new Error('Timeout waiting for drive content replication');
         }
 
         let fileCount = 0;
@@ -590,9 +615,15 @@ class HyperWormhole {
             await fs.mkdir(path.dirname(filePath), { recursive: true });
 
             try {
-                // Use drive.get() instead of streams for better reliability
+                // Use drive.get() with timeout to prevent hanging
                 console.log("Downloading file content...");
-                const content = await drive.get(entry.key);
+                
+                const downloadPromise = drive.get(entry.key, { wait: true });
+                const timeoutPromise = new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('Download timeout')), 30000)
+                );
+                
+                const content = await Promise.race([downloadPromise, timeoutPromise]);
                 
                 if (content) {
                     await fs.writeFile(filePath, content);
@@ -603,7 +634,7 @@ class HyperWormhole {
                 }
             } catch (error) {
                 console.error("Error downloading file", entry.key, ":", error);
-                throw error; // Rethrow to trigger retry
+                throw error;
             }
         }
 
@@ -612,15 +643,17 @@ class HyperWormhole {
         if (fileCount === 0) {
             throw new Error('No files were downloaded');
         }
+        
+        return { fileCount, totalSize };
     }
 
     wormholeCodeToTopic(code) {
-        return crypto.createHash('sha256').update(code).digest();
+        return nodeCrypto.createHash('sha256').update(code).digest();
     }
 
     encrypt(data, key) {
-        const iv = crypto.randomBytes(16);
-        const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+        const iv = nodeCrypto.randomBytes(16);
+        const cipher = nodeCrypto.createCipheriv('aes-256-gcm', key, iv);
         const encrypted = Buffer.concat([cipher.update(data), cipher.final()]);
         const tag = cipher.getAuthTag();
         return Buffer.concat([iv, tag, encrypted]);
@@ -630,7 +663,7 @@ class HyperWormhole {
         const iv = data.slice(0, 16);
         const tag = data.slice(16, 32);
         const encrypted = data.slice(32);
-        const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+        const decipher = nodeCrypto.createDecipheriv('aes-256-gcm', key, iv);
         decipher.setAuthTag(tag);
         return Buffer.concat([decipher.update(encrypted), decipher.final()]);
     }
