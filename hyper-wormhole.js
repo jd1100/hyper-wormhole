@@ -554,54 +554,77 @@ class HyperWormhole {
     async downloadDriveContents(drive, outputPath) {
         console.log("Starting downloadDriveContents to", outputPath);
         
-        // Wait for drive to have some content and be properly replicated
-        console.log('Waiting for drive replication...');
+        // Use drive.update() to wait for initial metadata replication
+        console.log('Waiting for drive metadata replication...');
+        try {
+            await drive.update({ wait: true });
+            console.log('Drive metadata synchronized');
+        } catch (error) {
+            console.log('Drive update error:', error.message);
+        }
+        
+        // Wait for peers and check replication status
         let attempts = 0;
-        const maxWaitAttempts = 30; // 30 seconds total
+        const maxWaitAttempts = 30;
         
         while (attempts < maxWaitAttempts) {
             try {
-                // Check if we have peers and they have content
+                // Check if we have active peers
                 if (drive.core.peers && drive.core.peers.length > 0) {
-                    let hasRemoteContent = false;
-                    for (const peer of drive.core.peers) {
-                        if (peer.remoteLength > 0) {
-                            hasRemoteContent = true;
-                            console.log(`Peer has ${peer.remoteLength} blocks available`);
-                            break;
-                        }
-                    }
+                    console.log(`Connected to ${drive.core.peers.length} peer(s)`);
                     
-                    if (hasRemoteContent) {
-                        // Try to list files - this will trigger downloading
+                    // Check if we can list files (metadata is ready)
+                    try {
                         const entries = [];
-                        for await (const entry of drive.list({ recursive: true })) {
-                            entries.push(entry);
-                        }
+                        let entryCount = 0;
+                        
+                        // Use a timeout for the listing operation
+                        const listPromise = (async () => {
+                            for await (const entry of drive.list({ recursive: true })) {
+                                entries.push(entry);
+                                entryCount++;
+                                console.log(`Found entry ${entryCount}: ${entry.key}`);
+                                
+                                // Stop after finding entries to avoid hanging
+                                if (entryCount >= 10) break; // Reasonable limit
+                            }
+                        })();
+                        
+                        await Promise.race([
+                            listPromise,
+                            new Promise((_, reject) => 
+                                setTimeout(() => reject(new Error('Listing timeout')), 10000)
+                            )
+                        ]);
                         
                         if (entries.length > 0) {
-                            console.log(`Found ${entries.length} entries, starting download...`);
+                            console.log(`Successfully found ${entries.length} entries, starting download...`);
                             break;
                         }
+                    } catch (listError) {
+                        console.log(`Listing attempt ${attempts + 1} failed:`, listError.message);
                     }
                 }
                 
-                console.log(`Attempt ${attempts + 1}: Waiting for replication...`);
+                console.log(`Attempt ${attempts + 1}/${maxWaitAttempts}: Waiting for metadata...`);
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                attempts++;
             } catch (error) {
-                console.log(`Attempt ${attempts + 1}: Error checking replication:`, error.message);
+                console.log(`Attempt ${attempts + 1}: Error:`, error.message);
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                attempts++;
             }
-            
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            attempts++;
         }
         
         if (attempts >= maxWaitAttempts) {
-            throw new Error('Timeout waiting for drive content replication');
+            throw new Error('Timeout waiting for drive metadata to replicate');
         }
 
+        // Now download all files
         let fileCount = 0;
         let totalSize = 0;
 
+        console.log('Starting file downloads...');
         for await (const entry of drive.list({ recursive: true })) {
             if (!entry.value.blob) {
                 console.log("Skipping non-blob entry:", entry.key);
@@ -609,32 +632,31 @@ class HyperWormhole {
             }
 
             fileCount++;
-            console.log("Processing file", fileCount, ":", entry.key);
+            console.log(`Processing file ${fileCount}: ${entry.key}`);
 
             const filePath = path.join(outputPath, entry.key);
             await fs.mkdir(path.dirname(filePath), { recursive: true });
 
             try {
-                // Use drive.get() with timeout to prevent hanging
                 console.log("Downloading file content...");
                 
-                const downloadPromise = drive.get(entry.key, { wait: true });
-                const timeoutPromise = new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error('Download timeout')), 30000)
-                );
+                // Use a more aggressive approach with drive.get
+                const content = await drive.get(entry.key, { 
+                    wait: true,
+                    timeout: 45000 // 45 second timeout per file
+                });
                 
-                const content = await Promise.race([downloadPromise, timeoutPromise]);
-                
-                if (content) {
+                if (content && content.length > 0) {
                     await fs.writeFile(filePath, content);
-                    console.log("Downloaded and saved:", crayon.yellow(filePath));
+                    console.log(`Downloaded and saved: ${crayon.yellow(filePath)} (${this.formatSize(content.length)})`);
                     totalSize += content.length;
                 } else {
                     console.log("No content received for:", entry.key);
                 }
             } catch (error) {
-                console.error("Error downloading file", entry.key, ":", error);
-                throw error;
+                console.error("Error downloading file", entry.key, ":", error.message);
+                // Continue with other files instead of throwing
+                console.log("Continuing with next file...");
             }
         }
 
