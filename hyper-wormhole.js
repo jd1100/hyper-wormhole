@@ -620,11 +620,11 @@ class HyperWormhole {
             throw new Error('Timeout waiting for drive metadata to replicate');
         }
 
-        // Now download all files
+        // Now download all files using streams
         let fileCount = 0;
         let totalSize = 0;
 
-        console.log('Starting file downloads...');
+        console.log('Starting file downloads with streaming...');
         for await (const entry of drive.list({ recursive: true })) {
             if (!entry.value.blob) {
                 console.log("Skipping non-blob entry:", entry.key);
@@ -638,23 +638,50 @@ class HyperWormhole {
             await fs.mkdir(path.dirname(filePath), { recursive: true });
 
             try {
-                console.log("Downloading file content...");
+                console.log("Streaming file content...");
                 
-                // Use a more aggressive approach with drive.get
-                const content = await drive.get(entry.key, { 
-                    wait: true,
-                    timeout: 45000 // 45 second timeout per file
+                // Use streams for better memory efficiency and progress tracking
+                const readStream = drive.createReadStream(entry.key);
+                const writeStream = fsSync.createWriteStream(filePath);
+                
+                // Track progress during streaming
+                let bytesDownloaded = 0;
+                readStream.on('data', (chunk) => {
+                    bytesDownloaded += chunk.length;
+                    // Update progress for large files
+                    if (bytesDownloaded % (1024 * 1024) === 0) { // Every MB
+                        console.log(`Downloaded ${this.formatSize(bytesDownloaded)} of ${entry.key}`);
+                    }
                 });
                 
-                if (content && content.length > 0) {
-                    await fs.writeFile(filePath, content);
-                    console.log(`Downloaded and saved: ${crayon.yellow(filePath)} (${this.formatSize(content.length)})`);
-                    totalSize += content.length;
-                } else {
-                    console.log("No content received for:", entry.key);
+                // Set up timeout for the streaming operation
+                const streamTimeout = setTimeout(() => {
+                    readStream.destroy();
+                    writeStream.destroy();
+                    console.error(`Timeout downloading ${entry.key}`);
+                }, 60000); // 60 second timeout
+                
+                try {
+                    await pipeline(readStream, writeStream);
+                    clearTimeout(streamTimeout);
+                    
+                    const stats = await fs.stat(filePath);
+                    totalSize += stats.size;
+                    
+                    console.log(`Streamed and saved: ${crayon.yellow(filePath)} (${this.formatSize(stats.size)})`);
+                } catch (pipelineError) {
+                    clearTimeout(streamTimeout);
+                    throw pipelineError;
                 }
+                
             } catch (error) {
-                console.error("Error downloading file", entry.key, ":", error.message);
+                console.error("Error streaming file", entry.key, ":", error.message);
+                // Clean up partial file
+                try {
+                    await fs.unlink(filePath);
+                } catch (unlinkError) {
+                    // Ignore unlink errors
+                }
                 // Continue with other files instead of throwing
                 console.log("Continuing with next file...");
             }
